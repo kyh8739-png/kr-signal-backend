@@ -1,8 +1,7 @@
-setuptools
-wheel
-flask==3.0.3
-flask-cors==4.0.1
+setuptools==69.5.1
 pykrx==1.0.45
 pandas==2.2.2
 numpy==1.26.4
+flask==3.0.3
+flask-cors==4.0.1
 gunicorn==22.0.0
