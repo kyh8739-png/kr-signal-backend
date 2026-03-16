@@ -1,15 +1,30 @@
 """
-KR Signal Backend — pykrx 없이 네이버 금융 직접 호출
+KR Signal Backend — KIS API 실시간 버전
+모의투자/실전투자 자동 전환 (KIS_MODE=virtual/real)
 """
 from flask import Flask, jsonify
 from flask_cors import CORS
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import requests, traceback, os
 
 app = Flask(__name__)
 CORS(app)
+
+# ─── KIS API 설정 ──────────────────────────────────────────────────
+KIS_APP_KEY    = os.environ.get("KIS_APP_KEY", "")
+KIS_APP_SECRET = os.environ.get("KIS_APP_SECRET", "")
+KIS_ACCOUNT    = os.environ.get("KIS_ACCOUNT", "")
+KIS_MODE       = os.environ.get("KIS_MODE", "virtual")  # virtual or real
+
+BASE_URL = (
+    "https://openapivts.koreainvestment.com:29443"  # 모의투자
+    if KIS_MODE == "virtual" else
+    "https://openapi.koreainvestment.com:9443"       # 실전투자
+)
+
+_token_cache = {"token": None, "expires": None}
 
 STOCKS = [
     {"code": "005930", "name": "삼성전자",       "sector": "반도체",   "cap": 4200},
@@ -26,17 +41,83 @@ STOCKS = [
     {"code": "000270", "name": "기아",             "sector": "자동차",   "cap": 480 },
 ]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Referer": "https://finance.naver.com",
-}
+# ─── KIS 토큰 발급 ─────────────────────────────────────────────────
+def get_token():
+    now = datetime.now()
+    if _token_cache["token"] and _token_cache["expires"] and now < _token_cache["expires"]:
+        return _token_cache["token"]
+    url  = f"{BASE_URL}/oauth2/tokenP"
+    body = {
+        "grant_type":    "client_credentials",
+        "appkey":        KIS_APP_KEY,
+        "appsecret":     KIS_APP_SECRET,
+    }
+    r = requests.post(url, json=body, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    _token_cache["token"]   = data["access_token"]
+    _token_cache["expires"] = now + timedelta(hours=23)
+    return _token_cache["token"]
 
-def fetch_ohlcv(code, pages=6):
+def kis_headers(tr_id):
+    return {
+        "Content-Type":  "application/json",
+        "authorization": f"Bearer {get_token()}",
+        "appkey":        KIS_APP_KEY,
+        "appsecret":     KIS_APP_SECRET,
+        "tr_id":         tr_id,
+        "custtype":      "P",
+    }
+
+# ─── KIS 일봉 데이터 ───────────────────────────────────────────────
+def fetch_ohlcv_kis(code, days=100):
+    """KIS API 주식 일봉 조회 (최대 100일)"""
+    end   = datetime.today().strftime("%Y%m%d")
+    start = (datetime.today() - timedelta(days=days)).strftime("%Y%m%d")
+    tr_id = "VTTC8416R" if KIS_MODE == "virtual" else "FHKST03010100"
+    url   = f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD":         code,
+        "FID_INPUT_DATE_1":       start,
+        "FID_INPUT_DATE_2":       end,
+        "FID_PERIOD_DIV_CODE":    "D",
+        "FID_ORG_ADJ_PRC":        "0",
+    }
+    r = requests.get(url, headers=kis_headers(tr_id), params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("rt_cd") != "0":
+        raise Exception(f"KIS API 오류: {data.get('msg1')}")
+    rows = []
+    for item in data.get("output2", []):
+        try:
+            rows.append({
+                "date":   pd.to_datetime(item["stck_bsop_date"]),
+                "open":   float(item["stck_oprc"]),
+                "high":   float(item["stck_hgpr"]),
+                "low":    float(item["stck_lwpr"]),
+                "close":  float(item["stck_clpr"]),
+                "volume": float(item["acml_vol"]),
+            })
+        except:
+            continue
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+    return df[df["close"] > 0].copy()
+
+# ─── 네이버 금융 폴백 (KIS 키 없을 때) ───────────────────────────
+def fetch_ohlcv_naver(code, pages=6):
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer":    "https://finance.naver.com",
+    }
     rows = []
     for page in range(1, pages + 1):
         url = f"https://finance.naver.com/item/sise_day.naver?code={code}&page={page}"
         try:
-            r = requests.get(url, headers=HEADERS, timeout=10)
+            r    = requests.get(url, headers=HEADERS, timeout=10)
             tbls = pd.read_html(r.text)
             for tbl in tbls:
                 tbl = tbl.dropna(how="all")
@@ -52,12 +133,25 @@ def fetch_ohlcv(code, pages=6):
                 tbl["date"] = pd.to_datetime(tbl["date"])
                 rows.append(tbl[["date","open","high","low","close","volume"]])
         except Exception as e:
-            print(f"[WARN] {code} page {page}: {e}")
+            print(f"[WARN] naver {code} p{page}: {e}")
     if not rows:
         return pd.DataFrame()
     df = pd.concat(rows).drop_duplicates("date").sort_values("date").reset_index(drop=True)
     return df[df["close"] > 0].copy()
 
+def fetch_ohlcv(code):
+    """KIS API 우선, 실패시 네이버 폴백"""
+    if KIS_APP_KEY and KIS_APP_SECRET:
+        try:
+            df = fetch_ohlcv_kis(code)
+            if len(df) >= 30:
+                return df, "kis"
+        except Exception as e:
+            print(f"[WARN] KIS failed for {code}: {e}, falling back to naver")
+    df = fetch_ohlcv_naver(code)
+    return df, "naver"
+
+# ─── 지표 계산 ─────────────────────────────────────────────────────
 def calc_rsi(closes, period=14):
     delta = closes.diff()
     ag = delta.clip(lower=0).ewm(com=period-1, min_periods=period).mean()
@@ -74,6 +168,7 @@ def calc_macd(closes, fast=12, slow=26, sig=9):
     m = closes.ewm(span=fast,adjust=False).mean() - closes.ewm(span=slow,adjust=False).mean()
     return m, m.ewm(span=sig, adjust=False).mean()
 
+# ─── 신호 감지 ─────────────────────────────────────────────────────
 def detect_signals(df):
     signals = []
     if len(df) < 30:
@@ -123,8 +218,9 @@ def detect_signals(df):
                 "stop":None,"target":None})
     return signals
 
+# ─── 종목 데이터 빌드 ──────────────────────────────────────────────
 def build_stock_data(code):
-    df = fetch_ohlcv(code)
+    df, source = fetch_ohlcv(code)
     if len(df) < 30:
         return None
     df["rsi"] = calc_rsi(df["close"])
@@ -156,8 +252,10 @@ def build_stock_data(code):
         "winRate":  round(wins/total*100) if total>0 else 0,
         "winTotal": total,
         "sparkline": df["close"].iloc[-30:].round().tolist(),
+        "source":   source,
     }
 
+# ─── API ───────────────────────────────────────────────────────────
 @app.route("/api/stocks")
 def get_stocks():
     result = []
@@ -184,7 +282,14 @@ def get_stock(code):
 
 @app.route("/api/health")
 def health():
-    return jsonify({"status":"ok","source":"naver-finance","time":datetime.now().isoformat()})
+    has_kis = bool(KIS_APP_KEY and KIS_APP_SECRET)
+    return jsonify({
+        "status":  "ok",
+        "mode":    KIS_MODE,
+        "source":  "kis" if has_kis else "naver-finance",
+        "kis_ready": has_kis,
+        "time":    datetime.now().isoformat(),
+    })
 
 if __name__ == "__main__":
     app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT",5001)))
