@@ -256,17 +256,29 @@ def build_stock_data(code):
     }
 
 # ─── API ───────────────────────────────────────────────────────────
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 @app.route("/api/stocks")
 def get_stocks():
-    result = []
-    for s in STOCKS:
+    def fetch_one(s):
         try:
             data = build_stock_data(s["code"])
             if data:
-                result.append({**s, **data})
+                return {**s, **data}
         except Exception as e:
             print(f"[ERROR] {s['code']}: {e}")
-            traceback.print_exc()
+        return None
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(fetch_one, s): s for s in STOCKS}
+        result = []
+        for future in as_completed(futures):
+            res = future.result()
+            if res:
+                result.append(res)
+
+    order = [s["code"] for s in STOCKS]
+    result.sort(key=lambda x: order.index(x["code"]) if x["code"] in order else 99)
     return jsonify(result)
 
 @app.route("/api/stock/<code>")
