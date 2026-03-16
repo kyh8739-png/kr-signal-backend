@@ -1,10 +1,11 @@
 """
-KR Signal Backend — KIS API 실시간 버전
-모의투자/실전투자 자동 전환 (KIS_MODE=virtual/real)
+KR Signal Backend — KIS API + 네이버 금융 폴백
+신호: Level1(관찰) RSI<=35+다이버전스 / Level2(강력) +MACD골든크로스
 """
 from flask import Flask, jsonify
 from flask_cors import CORS
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import numpy as np
 import requests, traceback, os
@@ -12,18 +13,12 @@ import requests, traceback, os
 app = Flask(__name__)
 CORS(app)
 
-# ─── KIS API 설정 ──────────────────────────────────────────────────
 KIS_APP_KEY    = os.environ.get("KIS_APP_KEY", "")
 KIS_APP_SECRET = os.environ.get("KIS_APP_SECRET", "")
 KIS_ACCOUNT    = os.environ.get("KIS_ACCOUNT", "")
-KIS_MODE       = os.environ.get("KIS_MODE", "virtual")  # virtual or real
-
-BASE_URL = (
-    "https://openapivts.koreainvestment.com:29443"  # 모의투자
-    if KIS_MODE == "virtual" else
-    "https://openapi.koreainvestment.com:9443"       # 실전투자
-)
-
+KIS_MODE       = os.environ.get("KIS_MODE", "virtual")
+BASE_URL = ("https://openapivts.koreainvestment.com:29443" if KIS_MODE == "virtual"
+            else "https://openapi.koreainvestment.com:9443")
 _token_cache = {"token": None, "expires": None}
 
 STOCKS = [
@@ -41,18 +36,14 @@ STOCKS = [
     {"code": "000270", "name": "기아",             "sector": "자동차",   "cap": 480 },
 ]
 
-# ─── KIS 토큰 발급 ─────────────────────────────────────────────────
 def get_token():
     now = datetime.now()
     if _token_cache["token"] and _token_cache["expires"] and now < _token_cache["expires"]:
         return _token_cache["token"]
-    url  = f"{BASE_URL}/oauth2/tokenP"
-    body = {
-        "grant_type":    "client_credentials",
-        "appkey":        KIS_APP_KEY,
-        "appsecret":     KIS_APP_SECRET,
-    }
-    r = requests.post(url, json=body, timeout=10)
+    r = requests.post(f"{BASE_URL}/oauth2/tokenP", json={
+        "grant_type": "client_credentials",
+        "appkey": KIS_APP_KEY, "appsecret": KIS_APP_SECRET,
+    }, timeout=10)
     r.raise_for_status()
     data = r.json()
     _token_cache["token"]   = data["access_token"]
@@ -60,104 +51,74 @@ def get_token():
     return _token_cache["token"]
 
 def kis_headers(tr_id):
-    return {
-        "Content-Type":  "application/json",
-        "authorization": f"Bearer {get_token()}",
-        "appkey":        KIS_APP_KEY,
-        "appsecret":     KIS_APP_SECRET,
-        "tr_id":         tr_id,
-        "custtype":      "P",
-    }
+    return {"Content-Type": "application/json",
+            "authorization": f"Bearer {get_token()}",
+            "appkey": KIS_APP_KEY, "appsecret": KIS_APP_SECRET,
+            "tr_id": tr_id, "custtype": "P"}
 
-# ─── KIS 일봉 데이터 ───────────────────────────────────────────────
-def fetch_ohlcv_kis(code, days=100):
-    """KIS API 주식 일봉 조회 (최대 100일)"""
+def fetch_ohlcv_kis(code):
     end   = datetime.today().strftime("%Y%m%d")
-    start = (datetime.today() - timedelta(days=days)).strftime("%Y%m%d")
+    start = (datetime.today() - timedelta(days=365)).strftime("%Y%m%d")
     tr_id = "VTTC8416R" if KIS_MODE == "virtual" else "FHKST03010100"
     url   = f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
-    params = {
-        "FID_COND_MRKT_DIV_CODE": "J",
-        "FID_INPUT_ISCD":         code,
-        "FID_INPUT_DATE_1":       start,
-        "FID_INPUT_DATE_2":       end,
-        "FID_PERIOD_DIV_CODE":    "D",
-        "FID_ORG_ADJ_PRC":        "0",
-    }
+    params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code,
+              "FID_INPUT_DATE_1": start, "FID_INPUT_DATE_2": end,
+              "FID_PERIOD_DIV_CODE": "D", "FID_ORG_ADJ_PRC": "0"}
     r = requests.get(url, headers=kis_headers(tr_id), params=params, timeout=15)
     r.raise_for_status()
     data = r.json()
     if data.get("rt_cd") != "0":
-        raise Exception(f"KIS API 오류: {data.get('msg1')}")
+        raise Exception(f"KIS: {data.get('msg1')}")
     rows = []
     for item in data.get("output2", []):
         try:
-            rows.append({
-                "date":   pd.to_datetime(item["stck_bsop_date"]),
-                "open":   float(item["stck_oprc"]),
-                "high":   float(item["stck_hgpr"]),
-                "low":    float(item["stck_lwpr"]),
-                "close":  float(item["stck_clpr"]),
-                "volume": float(item["acml_vol"]),
-            })
-        except:
-            continue
-    if not rows:
-        return pd.DataFrame()
+            rows.append({"date": pd.to_datetime(item["stck_bsop_date"]),
+                         "open": float(item["stck_oprc"]), "high": float(item["stck_hgpr"]),
+                         "low": float(item["stck_lwpr"]),  "close": float(item["stck_clpr"]),
+                         "volume": float(item["acml_vol"])})
+        except: continue
+    if not rows: return pd.DataFrame()
     df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
     return df[df["close"] > 0].copy()
 
-# ─── 네이버 금융 폴백 (KIS 키 없을 때) ───────────────────────────
-def fetch_ohlcv_naver(code, pages=6):
-    HEADERS = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer":    "https://finance.naver.com",
-    }
+def fetch_ohlcv_naver(code, pages=8):
+    HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com"}
     rows = []
     for page in range(1, pages + 1):
-        url = f"https://finance.naver.com/item/sise_day.naver?code={code}&page={page}"
         try:
-            r    = requests.get(url, headers=HEADERS, timeout=10)
+            r    = requests.get(f"https://finance.naver.com/item/sise_day.naver?code={code}&page={page}",
+                                headers=HEADERS, timeout=10)
             tbls = pd.read_html(r.text)
             for tbl in tbls:
                 tbl = tbl.dropna(how="all")
-                if tbl.shape[1] < 7:
-                    continue
+                if tbl.shape[1] < 7: continue
                 tbl.columns = ["date","close","diff","open","high","low","volume"]
                 tbl = tbl[tbl["date"].astype(str).str.match(r"\d{4}\.\d{2}\.\d{2}")]
-                if len(tbl) == 0:
-                    continue
+                if len(tbl) == 0: continue
                 for col in ["close","open","high","low","volume"]:
-                    tbl[col] = pd.to_numeric(
-                        tbl[col].astype(str).str.replace(",",""), errors="coerce")
+                    tbl[col] = pd.to_numeric(tbl[col].astype(str).str.replace(",",""), errors="coerce")
                 tbl["date"] = pd.to_datetime(tbl["date"])
                 rows.append(tbl[["date","open","high","low","close","volume"]])
         except Exception as e:
             print(f"[WARN] naver {code} p{page}: {e}")
-    if not rows:
-        return pd.DataFrame()
+    if not rows: return pd.DataFrame()
     df = pd.concat(rows).drop_duplicates("date").sort_values("date").reset_index(drop=True)
     return df[df["close"] > 0].copy()
 
 def fetch_ohlcv(code):
-    """KIS API 우선, 실패시 네이버 폴백"""
     if KIS_APP_KEY and KIS_APP_SECRET:
         try:
             df = fetch_ohlcv_kis(code)
-            if len(df) >= 30:
-                return df, "kis"
+            if len(df) >= 30: return df, "kis"
         except Exception as e:
-            print(f"[WARN] KIS failed for {code}: {e}, falling back to naver")
-    df = fetch_ohlcv_naver(code)
-    return df, "naver"
+            print(f"[WARN] KIS {code}: {e}")
+    return fetch_ohlcv_naver(code), "naver"
 
-# ─── 지표 계산 ─────────────────────────────────────────────────────
 def calc_rsi(closes, period=14):
     delta = closes.diff()
     ag = delta.clip(lower=0).ewm(com=period-1, min_periods=period).mean()
     al = (-delta.clip(upper=0)).ewm(com=period-1, min_periods=period).mean()
-    rs = ag / al.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + ag / al.replace(0, np.nan)))
 
 def calc_bb(closes, period=20, mult=2):
     mid = closes.rolling(period).mean()
@@ -168,86 +129,66 @@ def calc_macd(closes, fast=12, slow=26, sig=9):
     m = closes.ewm(span=fast,adjust=False).mean() - closes.ewm(span=slow,adjust=False).mean()
     return m, m.ewm(span=sig, adjust=False).mean()
 
-# ─── 신호 감지 ─────────────────────────────────────────────────────
 def detect_signals(df):
+    """
+    Level 1 (관찰): RSI <= 35 + 상승 다이버전스
+    Level 2 (강력): RSI <= 35 + 상승 다이버전스 + MACD 골든크로스
+    """
     signals = []
-    if len(df) < 30:
-        return signals
-    rsi  = df["rsi"].iloc[-1]
-    bbu  = df["bbu"].iloc[-1]
-    bbm  = df["bbm"].iloc[-1]
-    bbl  = df["bbl"].iloc[-1]
-    macd = df["macd"].iloc[-1]; macd_p = df["macd"].iloc[-2]
-    sig  = df["sig"].iloc[-1];  sig_p  = df["sig"].iloc[-2]
-    c=df["close"].iloc[-1]; cp=df["close"].iloc[-2]
-    o=df["open"].iloc[-1];  op=df["open"].iloc[-2]
-    lp=df["low"].iloc[-2];  hp=df["high"].iloc[-2]
+    if len(df) < 6: return signals
 
-    if rsi <= 30:
-        if lp < bbl and (c>op) and (o<cp) and (c>o):
-            signals.append({"type":"A","direction":"BUY","level":2,
-                "title":"강력 매수 신호 [전략A]",
-                "desc":f"RSI {rsi:.1f} 과매도+BB하단 이탈+장악형 양봉",
-                "stop":round(bbl*0.99),"target":round(bbm+(bbm-bbl))})
-        elif lp < bbl:
-            signals.append({"type":"A","direction":"WATCH","level":1,
-                "title":"관심 등록 [전략A]",
-                "desc":f"RSI {rsi:.1f} 과매도+BB이탈. 장악형 캔들 대기.",
-                "stop":None,"target":None})
+    rsi    = df["rsi"].iloc[-1]
+    macd   = df["macd"].iloc[-1]; macd_p = df["macd"].iloc[-2]
+    sig    = df["sig"].iloc[-1];  sig_p  = df["sig"].iloc[-2]
+    c      = df["close"].iloc[-1]
+    c4     = df["close"].iloc[-5]
+    r4     = df["rsi"].iloc[-5]
 
-    if rsi >= 70 and hp > bbu and (c<op) and (o>cp) and (c<o):
-        signals.append({"type":"A","direction":"SELL","level":2,
-            "title":"강력 매도 신호 [전략A]",
-            "desc":f"RSI {rsi:.1f} 과매수+BB상단+장악형 음봉",
-            "stop":round(bbu*1.01),"target":round(bbm-(bbu-bbm))})
+    rsi_ok   = rsi <= 35
+    div_ok   = (c < c4) and (rsi > r4)
+    cross_ok = (macd_p < sig_p) and (macd > sig)
 
-    if rsi <= 35 and len(df) >= 6:
-        c4=df["close"].iloc[-5]; r4=df["rsi"].iloc[-5]
-        cross=(macd_p<sig_p)and(macd>sig)
-        bull=(c>op)and(o<cp)
-        if (c<c4)and(rsi>r4)and cross and bull:
-            sv=float(df["low"].iloc[-5:].min())*0.99
-            signals.append({"type":"B","direction":"BUY","level":2,
-                "title":"추세 반전 확정 [전략B]",
-                "desc":"상승 다이버전스+MACD 골든크로스+장악형 3중 확인",
-                "stop":round(sv),"target":round(c+(c-sv)*2)})
-        elif (c<c4)and(rsi>r4):
-            signals.append({"type":"B","direction":"WATCH","level":1,
-                "title":"추세 전환 징후 [전략B]",
-                "desc":"상승 다이버전스 감지. MACD+장악형 캔들 대기.",
-                "stop":None,"target":None})
+    if rsi_ok and div_ok and cross_ok:
+        sv = float(df["low"].iloc[-5:].min()) * 0.99
+        signals.append({"type":"2","direction":"BUY","level":2,
+            "title":"강력 진입 신호",
+            "desc":f"RSI {rsi:.1f} + 상승 다이버전스 + MACD 골든크로스",
+            "stop":round(sv),"target":round(c+(c-sv)*2)})
+    elif rsi_ok and div_ok:
+        signals.append({"type":"1","direction":"WATCH","level":1,
+            "title":"관찰 신호",
+            "desc":f"RSI {rsi:.1f} + 상승 다이버전스. MACD 골든크로스 대기.",
+            "stop":None,"target":None})
     return signals
 
-# ─── 종목 데이터 빌드 ──────────────────────────────────────────────
 def build_stock_data(code):
     df, source = fetch_ohlcv(code)
-    if len(df) < 30:
-        return None
-    df["rsi"] = calc_rsi(df["close"])
-    df["bbu"], df["bbm"], df["bbl"] = calc_bb(df["close"])
-    df["macd"], df["sig"] = calc_macd(df["close"])
+    if len(df) < 30: return None
+    df["rsi"]             = calc_rsi(df["close"])
+    df["bbu"],df["bbm"],df["bbl"] = calc_bb(df["close"])
+    df["macd"],df["sig"]  = calc_macd(df["close"])
     df = df.dropna()
-    if len(df) < 10:
-        return None
+    if len(df) < 10: return None
+
     signals = detect_signals(df)
+
     wins, total = 0, 0
-    for i in range(20, len(df)-5):
-        if df["rsi"].iloc[i] <= 30:
+    for i in range(5, len(df)-5):
+        rsi_i = df["rsi"].iloc[i]; c_i = df["close"].iloc[i]
+        c_i4  = df["close"].iloc[i-4]; rsi_i4 = df["rsi"].iloc[i-4]
+        if rsi_i <= 35 and (c_i < c_i4) and (rsi_i > rsi_i4):
             total += 1
-            if df["close"].iloc[i+5] > df["close"].iloc[i]:
-                wins += 1
+            if df["close"].iloc[i+5] > c_i: wins += 1
+
     last = df.iloc[-1]; prev = df.iloc[-2]
     chg  = ((last["close"]-prev["close"])/prev["close"])*100
     return {
-        "price":    int(last["close"]),
-        "change":   round(float(chg),2),
+        "price":    int(last["close"]),  "change":   round(float(chg),2),
         "rsi":      round(float(df["rsi"].iloc[-1]),1),
         "macdVal":  round(float(df["macd"].iloc[-1]),0),
         "sigVal":   round(float(df["sig"].iloc[-1]),0),
-        "bbUpper":  int(last["bbu"]),
-        "bbMid":    int(last["bbm"]),
-        "bbLower":  int(last["bbl"]),
-        "volume":   int(last["volume"]),
+        "bbUpper":  int(last["bbu"]),    "bbMid":    int(last["bbm"]),
+        "bbLower":  int(last["bbl"]),    "volume":   int(last["volume"]),
         "signals":  signals,
         "winRate":  round(wins/total*100) if total>0 else 0,
         "winTotal": total,
@@ -255,27 +196,18 @@ def build_stock_data(code):
         "source":   source,
     }
 
-# ─── API ───────────────────────────────────────────────────────────
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 @app.route("/api/stocks")
 def get_stocks():
     def fetch_one(s):
         try:
             data = build_stock_data(s["code"])
-            if data:
-                return {**s, **data}
+            return {**s, **data} if data else None
         except Exception as e:
-            print(f"[ERROR] {s['code']}: {e}")
-        return None
+            print(f"[ERROR] {s['code']}: {e}"); return None
 
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(fetch_one, s): s for s in STOCKS}
-        result = []
-        for future in as_completed(futures):
-            res = future.result()
-            if res:
-                result.append(res)
+        result  = [f.result() for f in as_completed(futures) if f.result()]
 
     order = [s["code"] for s in STOCKS]
     result.sort(key=lambda x: order.index(x["code"]) if x["code"] in order else 99)
@@ -284,69 +216,66 @@ def get_stocks():
 @app.route("/api/stock/<code>")
 def get_stock(code):
     s = next((x for x in STOCKS if x["code"]==code), None)
-    if not s:
-        return jsonify({"error":"not found"}),404
+    if not s: return jsonify({"error":"not found"}),404
     try:
         data = build_stock_data(code)
         return jsonify({**s,**data}) if data else (jsonify({"error":"no data"}),503)
     except Exception as e:
         return jsonify({"error":str(e)}),500
 
-@app.route("/api/health")
-def health():
-    has_kis = bool(KIS_APP_KEY and KIS_APP_SECRET)
-    return jsonify({
-        "status":  "ok",
-        "mode":    KIS_MODE,
-        "source":  "kis" if has_kis else "naver-finance",
-        "kis_ready": has_kis,
-        "time":    datetime.now().isoformat(),
-    })
 @app.route("/api/backtest/<code>")
 def backtest(code):
     s = next((x for x in STOCKS if x["code"]==code), None)
-    if not s:
-        return jsonify({"error":"not found"}),404
+    if not s: return jsonify({"error":"not found"}),404
     try:
         df, src = fetch_ohlcv(code)
-        if len(df) < 30:
-            return jsonify({"error":"데이터 부족"}),503
-        df["rsi"] = calc_rsi(df["close"])
+        if len(df) < 30: return jsonify({"error":"데이터 부족"}),503
+        df["rsi"]             = calc_rsi(df["close"])
         df["bbu"],df["bbm"],df["bbl"] = calc_bb(df["close"])
-        df["macd"],df["sig"] = calc_macd(df["close"])
+        df["macd"],df["sig"]  = calc_macd(df["close"])
         df = df.dropna()
+
         trades = []
-        for i in range(30, len(df)-10):
-            w = df.iloc[:i+1]
-            sigs = detect_signals(w)
-            for sig in sigs:
-                if sig["level"]==2 and sig["direction"] in ("BUY","SELL"):
-                    entry  = int(df["close"].iloc[i])
-                    exit5  = int(df["close"].iloc[i+5])
-                    exit10 = int(df["close"].iloc[i+10])
-                    pnl5   = round((exit5-entry)/entry*100,2)
-                    pnl10  = round((exit10-entry)/entry*100,2)
-                    if sig["direction"]=="SELL":
-                        pnl5,pnl10 = -pnl5,-pnl10
-                    trades.append({
-                        "date":str(df.index[i].date()) if hasattr(df.index[i],"date") else str(df["date"].iloc[i])[:10],
-                        "type":sig["type"],"direction":sig["direction"],
-                        "entry":entry,"exit5":exit5,"exit10":exit10,
-                        "pnl5":pnl5,"pnl10":pnl10,"win5":pnl5>0,
-                        "rsi":round(float(df["rsi"].iloc[i]),1),
-                    })
+        for i in range(5, len(df)-10):
+            rsi_i  = df["rsi"].iloc[i];  c_i   = df["close"].iloc[i]
+            c_i4   = df["close"].iloc[i-4]; rsi_i4 = df["rsi"].iloc[i-4]
+            macd_i = df["macd"].iloc[i];  macd_p = df["macd"].iloc[i-1]
+            sig_i  = df["sig"].iloc[i];   sig_p  = df["sig"].iloc[i-1]
+            div_ok   = (c_i < c_i4) and (rsi_i > rsi_i4)
+            cross_ok = (macd_p < sig_p) and (macd_i > sig_i)
+
+            if rsi_i <= 35 and div_ok:
+                level = 2 if cross_ok else 1
+                desc  = "강력 진입" if cross_ok else "관찰"
+                entry = int(c_i)
+                exit5 = int(df["close"].iloc[i+5])
+                exit10= int(df["close"].iloc[i+10])
+                pnl5  = round((exit5-entry)/entry*100,2)
+                pnl10 = round((exit10-entry)/entry*100,2)
+                idx   = df.index[i]
+                date_str = str(idx.date()) if hasattr(idx,"date") else str(df["date"].iloc[i])[:10]
+                trades.append({"date":date_str,"level":level,"desc":desc,
+                    "direction":"BUY","entry":entry,"exit5":exit5,"exit10":exit10,
+                    "pnl5":pnl5,"pnl10":pnl10,"win5":pnl5>0,
+                    "rsi":round(float(rsi_i),1)})
+
         wins  = sum(1 for t in trades if t["win5"])
         total = len(trades)
-        avg5  = round(sum(t["pnl5"] for t in trades)/total,2) if total else 0
+        avg5  = round(sum(t["pnl5"]  for t in trades)/total,2) if total else 0
         avg10 = round(sum(t["pnl10"] for t in trades)/total,2) if total else 0
-        return jsonify({
-            "stock":s,"trades":trades[-30:],
+        return jsonify({"stock":s,"trades":trades[-30:],
             "summary":{"total":total,"wins":wins,
                 "winRate":round(wins/total*100) if total else 0,
-                "avgPnl5":avg5,"avgPnl10":avg10}
-        })
+                "avgPnl5":avg5,"avgPnl10":avg10}})
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error":str(e)}),500
+
+@app.route("/api/health")
+def health():
+    return jsonify({"status":"ok","mode":KIS_MODE,
+        "source":"kis" if KIS_APP_KEY else "naver",
+        "kis_ready":bool(KIS_APP_KEY),"time":datetime.now().isoformat()})
+
 if __name__ == "__main__":
     app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT",5001)))
