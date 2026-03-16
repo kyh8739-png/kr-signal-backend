@@ -290,6 +290,51 @@ def health():
         "kis_ready": has_kis,
         "time":    datetime.now().isoformat(),
     })
-
+@app.route("/api/backtest/<code>")
+def backtest(code):
+    s = next((x for x in STOCKS if x["code"]==code), None)
+    if not s:
+        return jsonify({"error":"not found"}),404
+    try:
+        df, src = fetch_ohlcv(code)
+        if len(df) < 30:
+            return jsonify({"error":"데이터 부족"}),503
+        df["rsi"] = calc_rsi(df["close"])
+        df["bbu"],df["bbm"],df["bbl"] = calc_bb(df["close"])
+        df["macd"],df["sig"] = calc_macd(df["close"])
+        df = df.dropna()
+        trades = []
+        for i in range(30, len(df)-10):
+            w = df.iloc[:i+1]
+            sigs = detect_signals(w)
+            for sig in sigs:
+                if sig["level"]==2 and sig["direction"] in ("BUY","SELL"):
+                    entry  = int(df["close"].iloc[i])
+                    exit5  = int(df["close"].iloc[i+5])
+                    exit10 = int(df["close"].iloc[i+10])
+                    pnl5   = round((exit5-entry)/entry*100,2)
+                    pnl10  = round((exit10-entry)/entry*100,2)
+                    if sig["direction"]=="SELL":
+                        pnl5,pnl10 = -pnl5,-pnl10
+                    trades.append({
+                        "date":str(df.index[i].date()) if hasattr(df.index[i],"date") else str(df["date"].iloc[i])[:10],
+                        "type":sig["type"],"direction":sig["direction"],
+                        "entry":entry,"exit5":exit5,"exit10":exit10,
+                        "pnl5":pnl5,"pnl10":pnl10,"win5":pnl5>0,
+                        "rsi":round(float(df["rsi"].iloc[i]),1),
+                    })
+        wins  = sum(1 for t in trades if t["win5"])
+        total = len(trades)
+        avg5  = round(sum(t["pnl5"] for t in trades)/total,2) if total else 0
+        avg10 = round(sum(t["pnl10"] for t in trades)/total,2) if total else 0
+        return jsonify({
+            "stock":s,"trades":trades[-30:],
+            "summary":{"total":total,"wins":wins,
+                "winRate":round(wins/total*100) if total else 0,
+                "avgPnl5":avg5,"avgPnl10":avg10}
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error":str(e)}),500
 if __name__ == "__main__":
     app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT",5001)))
