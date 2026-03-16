@@ -81,7 +81,7 @@ def fetch_ohlcv_kis(code):
     df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
     return df[df["close"] > 0].copy()
 
-def fetch_ohlcv_naver(code, pages=8):
+def fetch_ohlcv_naver(code, pages=25):
     HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com"}
     rows = []
     for page in range(1, pages + 1):
