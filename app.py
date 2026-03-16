@@ -1,6 +1,7 @@
 """
 KR Signal Backend — KIS API + 네이버 금융 폴백
-신호: Level1(관찰) RSI<=35+다이버전스 / Level2(강력) +MACD골든크로스
+신호: Level1(관찰) / Level2(강력)
+백테스트: 손절선(BB하단/전저점) + 손익비(RR) 포함
 """
 from flask import Flask, jsonify
 from flask_cors import CORS
@@ -74,7 +75,7 @@ def fetch_ohlcv_kis(code):
         try:
             rows.append({"date": pd.to_datetime(item["stck_bsop_date"]),
                          "open": float(item["stck_oprc"]), "high": float(item["stck_hgpr"]),
-                         "low": float(item["stck_lwpr"]),  "close": float(item["stck_clpr"]),
+                         "low":  float(item["stck_lwpr"]), "close": float(item["stck_clpr"]),
                          "volume": float(item["acml_vol"])})
         except: continue
     if not rows: return pd.DataFrame()
@@ -129,49 +130,56 @@ def calc_macd(closes, fast=12, slow=26, sig=9):
     m = closes.ewm(span=fast,adjust=False).mean() - closes.ewm(span=slow,adjust=False).mean()
     return m, m.ewm(span=sig, adjust=False).mean()
 
+def calc_stop(df, i):
+    """손절선: BB하단 vs 최근 5봉 저점 중 낮은 값 * 0.99"""
+    bb_l  = float(df["bbl"].iloc[i])
+    low5  = float(df["low"].iloc[max(0, i-4):i+1].min())
+    return round(min(bb_l, low5) * 0.99)
+
 def detect_signals(df):
-    """
-    Level 1 (관찰): RSI <= 35 + 상승 다이버전스
-    Level 2 (강력): RSI <= 35 + 상승 다이버전스 + MACD 골든크로스
-    """
     signals = []
     if len(df) < 6: return signals
-
     rsi    = df["rsi"].iloc[-1]
     macd   = df["macd"].iloc[-1]; macd_p = df["macd"].iloc[-2]
     sig    = df["sig"].iloc[-1];  sig_p  = df["sig"].iloc[-2]
     c      = df["close"].iloc[-1]
     c4     = df["close"].iloc[-5]
     r4     = df["rsi"].iloc[-5]
-
     rsi_ok   = rsi <= 35
     div_ok   = (c < c4) and (rsi > r4)
     cross_ok = (macd_p < sig_p) and (macd > sig)
 
     if rsi_ok and div_ok and cross_ok:
-        sv = float(df["low"].iloc[-5:].min()) * 0.99
+        stop = calc_stop(df, -1)
+        risk = c - stop
         signals.append({"type":"2","direction":"BUY","level":2,
             "title":"강력 진입 신호",
             "desc":f"RSI {rsi:.1f} + 상승 다이버전스 + MACD 골든크로스",
-            "stop":round(sv),"target":round(c+(c-sv)*2)})
+            "stop":   stop,
+            "target": round(c + risk * 2),   # 1:2
+            "target15": round(c + risk * 1.5) # 1:1.5
+        })
     elif rsi_ok and div_ok:
+        stop = calc_stop(df, -1)
+        risk = c - stop
         signals.append({"type":"1","direction":"WATCH","level":1,
             "title":"관찰 신호",
             "desc":f"RSI {rsi:.1f} + 상승 다이버전스. MACD 골든크로스 대기.",
-            "stop":None,"target":None})
+            "stop":   stop,
+            "target": round(c + risk * 2),
+            "target15": round(c + risk * 1.5)
+        })
     return signals
 
 def build_stock_data(code):
     df, source = fetch_ohlcv(code)
     if len(df) < 30: return None
-    df["rsi"]             = calc_rsi(df["close"])
+    df["rsi"]              = calc_rsi(df["close"])
     df["bbu"],df["bbm"],df["bbl"] = calc_bb(df["close"])
-    df["macd"],df["sig"]  = calc_macd(df["close"])
+    df["macd"],df["sig"]   = calc_macd(df["close"])
     df = df.dropna()
     if len(df) < 10: return None
-
     signals = detect_signals(df)
-
     wins, total = 0, 0
     for i in range(5, len(df)-5):
         rsi_i = df["rsi"].iloc[i]; c_i = df["close"].iloc[i]
@@ -179,7 +187,6 @@ def build_stock_data(code):
         if rsi_i <= 35 and (c_i < c_i4) and (rsi_i > rsi_i4):
             total += 1
             if df["close"].iloc[i+5] > c_i: wins += 1
-
     last = df.iloc[-1]; prev = df.iloc[-2]
     chg  = ((last["close"]-prev["close"])/prev["close"])*100
     return {
@@ -204,11 +211,9 @@ def get_stocks():
             return {**s, **data} if data else None
         except Exception as e:
             print(f"[ERROR] {s['code']}: {e}"); return None
-
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(fetch_one, s): s for s in STOCKS}
         result  = [f.result() for f in as_completed(futures) if f.result()]
-
     order = [s["code"] for s in STOCKS]
     result.sort(key=lambda x: order.index(x["code"]) if x["code"] in order else 99)
     return jsonify(result)
@@ -230,39 +235,61 @@ def backtest(code):
     try:
         df, src = fetch_ohlcv(code)
         if len(df) < 30: return jsonify({"error":"데이터 부족"}),503
-        df["rsi"]             = calc_rsi(df["close"])
+        df["rsi"]              = calc_rsi(df["close"])
         df["bbu"],df["bbm"],df["bbl"] = calc_bb(df["close"])
-        df["macd"],df["sig"]  = calc_macd(df["close"])
+        df["macd"],df["sig"]   = calc_macd(df["close"])
         df = df.dropna()
 
         trades = []
         for i in range(5, len(df)-10):
-            rsi_i  = df["rsi"].iloc[i];  c_i   = df["close"].iloc[i]
+            rsi_i  = df["rsi"].iloc[i];  c_i    = df["close"].iloc[i]
             c_i4   = df["close"].iloc[i-4]; rsi_i4 = df["rsi"].iloc[i-4]
             macd_i = df["macd"].iloc[i];  macd_p = df["macd"].iloc[i-1]
             sig_i  = df["sig"].iloc[i];   sig_p  = df["sig"].iloc[i-1]
             div_ok   = (c_i < c_i4) and (rsi_i > rsi_i4)
             cross_ok = (macd_p < sig_p) and (macd_i > sig_i)
+            if not (rsi_i <= 35 and div_ok): continue
 
-            if rsi_i <= 35 and div_ok:
-                level = 2 if cross_ok else 1
-                desc  = "강력 진입" if cross_ok else "관찰"
-                entry = int(c_i)
-                exit5 = int(df["close"].iloc[i+5])
-                exit10= int(df["close"].iloc[i+10])
-                pnl5  = round((exit5-entry)/entry*100,2)
-                pnl10 = round((exit10-entry)/entry*100,2)
-                idx   = df.index[i]
-                date_str = str(idx.date()) if hasattr(idx,"date") else str(df["date"].iloc[i])[:10]
-                trades.append({"date":date_str,"level":level,"desc":desc,
-                    "direction":"BUY","entry":entry,"exit5":exit5,"exit10":exit10,
-                    "pnl5":pnl5,"pnl10":pnl10,"win5":pnl5>0,
-                    "rsi":round(float(rsi_i),1)})
+            level = 2 if cross_ok else 1
+            entry = int(c_i)
+            exit5 = int(df["close"].iloc[i+5])
+            exit10= int(df["close"].iloc[i+10])
+            pnl5  = round((exit5-entry)/entry*100, 2)
+            pnl10 = round((exit10-entry)/entry*100, 2)
+
+            # 손절선: BB하단 vs 전저점 중 낮은 값
+            bb_l  = float(df["bbl"].iloc[i])
+            low5  = float(df["low"].iloc[max(0,i-4):i+1].min())
+            stop  = round(min(bb_l, low5) * 0.99)
+            risk  = entry - stop if entry > stop else 1
+            target_2r  = round(entry + risk * 2)
+            target_15r = round(entry + risk * 1.5)
+            rr_actual  = round((exit5 - entry) / risk, 2) if risk > 0 else 0
+
+            idx = df.index[i]
+            date_str = str(idx.date()) if hasattr(idx,"date") else str(df["date"].iloc[i])[:10]
+
+            trades.append({
+                "date":      date_str,
+                "level":     level,
+                "direction": "BUY",
+                "entry":     entry,
+                "stop":      stop,
+                "target2r":  target_2r,
+                "target15r": target_15r,
+                "exit5":     exit5,
+                "exit10":    exit10,
+                "pnl5":      pnl5,
+                "pnl10":     pnl10,
+                "win5":      pnl5 > 0,
+                "rsi":       round(float(rsi_i), 1),
+                "rr_actual": rr_actual,
+            })
 
         wins  = sum(1 for t in trades if t["win5"])
         total = len(trades)
-        avg5  = round(sum(t["pnl5"]  for t in trades)/total,2) if total else 0
-        avg10 = round(sum(t["pnl10"] for t in trades)/total,2) if total else 0
+        avg5  = round(sum(t["pnl5"]  for t in trades)/total, 2) if total else 0
+        avg10 = round(sum(t["pnl10"] for t in trades)/total, 2) if total else 0
         return jsonify({"stock":s,"trades":trades[-30:],
             "summary":{"total":total,"wins":wins,
                 "winRate":round(wins/total*100) if total else 0,
